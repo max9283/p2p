@@ -1,0 +1,459 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "p2p-messenger"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.p2pchat"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.p2pchat"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="P2P Чат"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/p2pchat
+          cat > app/src/main/java/com/example/p2pchat/PeerNode.kt <<'EOF'
+          package com.example.p2pchat
+
+          import java.io.DataInputStream
+          import java.io.DataOutputStream
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.util.concurrent.CopyOnWriteArrayList
+          import kotlin.concurrent.thread
+
+          /**
+           * Узел P2P: одновременно и сервер (принимает входящие), и клиент (подключается к другим).
+           * Протокол: на каждое сообщение — строка UTF (DataOutputStream.writeUTF).
+           *   "HELLO:<имя>"  — представление при подключении
+           *   "MSG:<текст>"  — сообщение
+           */
+          class PeerNode(
+              private val port: Int,
+              private val onEvent: (String) -> Unit,
+              private val onMessage: (from: String, text: String, mine: Boolean) -> Unit
+          ) {
+              @Volatile
+              var myName: String = "Аноним"
+
+              @Volatile
+              private var server: ServerSocket? = null
+
+              @Volatile
+              private var running = false
+
+              private val peers = CopyOnWriteArrayList<Peer>()
+
+              private class Peer(val socket: Socket) {
+                  val input = DataInputStream(socket.getInputStream().buffered())
+                  val output = DataOutputStream(socket.getOutputStream().buffered())
+
+                  @Volatile
+                  var name: String = socket.inetAddress?.hostAddress ?: "?"
+
+                  fun send(text: String) {
+                      synchronized(output) {
+                          output.writeUTF(text)
+                          output.flush()
+                      }
+                  }
+              }
+
+              fun start() {
+                  if (running) return
+                  running = true
+                  thread(isDaemon = true, name = "p2p-accept") {
+                      try {
+                          val ss = ServerSocket(port)
+                          server = ss
+                          onEvent("Слушаю порт $port")
+                          while (running) {
+                              val socket = ss.accept()
+                              handle(socket)
+                          }
+                      } catch (e: Exception) {
+                          if (running) onEvent("Ошибка сервера: ${e.message}")
+                      }
+                  }
+              }
+
+              fun connect(host: String) {
+                  thread(isDaemon = true, name = "p2p-connect") {
+                      try {
+                          onEvent("Подключаюсь к $host…")
+                          val socket = Socket()
+                          socket.connect(InetSocketAddress(host, port), 5000)
+                          handle(socket)
+                      } catch (e: Exception) {
+                          onEvent("Не удалось подключиться к $host: ${e.message}")
+                      }
+                  }
+              }
+
+              fun send(text: String) {
+                  if (peers.isEmpty()) {
+                      onEvent("Нет подключённых собеседников")
+                      return
+                  }
+                  thread(isDaemon = true, name = "p2p-send") {
+                      var delivered = false
+                      for (p in peers) {
+                          try {
+                              p.send("MSG:$text")
+                              delivered = true
+                          } catch (e: Exception) {
+                              onEvent("Не доставлено ${p.name}: ${e.message}")
+                          }
+                      }
+                      if (delivered) onMessage(myName, text, true)
+                  }
+              }
+
+              private fun handle(socket: Socket) {
+                  thread(isDaemon = true, name = "p2p-peer") {
+                      var peer: Peer? = null
+                      try {
+                          socket.keepAlive = true
+                          socket.tcpNoDelay = true
+                          val p = Peer(socket)
+                          peer = p
+                          peers.add(p)
+                          p.send("HELLO:$myName")
+                          while (running) {
+                              val line = p.input.readUTF()
+                              when {
+                                  line.startsWith("HELLO:") -> {
+                                      p.name = line.removePrefix("HELLO:").ifBlank { p.name }
+                                      onEvent("Подключён: ${p.name}")
+                                  }
+                                  line.startsWith("MSG:") -> {
+                                      onMessage(p.name, line.removePrefix("MSG:"), false)
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          // соединение закрыто или оборвалось
+                      } finally {
+                          peer?.let {
+                              peers.remove(it)
+                              onEvent("Отключён: ${it.name}")
+                          }
+                          try {
+                              socket.close()
+                          } catch (_: Exception) {
+                          }
+                      }
+                  }
+              }
+
+              fun stop() {
+                  running = false
+                  try {
+                      server?.close()
+                  } catch (_: Exception) {
+                  }
+                  for (p in peers) {
+                      try {
+                          p.socket.close()
+                      } catch (_: Exception) {
+                      }
+                  }
+                  peers.clear()
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/p2pchat
+          cat > app/src/main/java/com/example/p2pchat/MainActivity.kt <<'EOF'
+          package com.example.p2pchat
+
+          import android.app.Activity
+          import android.content.Context
+          import android.os.Bundle
+          import android.text.Editable
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+
+          class MainActivity : Activity() {
+
+              companion object {
+                  const val PORT = 8888
+                  const val MAX_LEN = 2000
+              }
+
+              private lateinit var node: PeerNode
+              private lateinit var adapter: ArrayAdapter<String>
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val prefs = getSharedPreferences("p2p", Context.MODE_PRIVATE)
+                  val density = resources.displayMetrics.density
+                  fun px(v: Int) = (v * density).toInt()
+
+                  val match = ViewGroup.LayoutParams.MATCH_PARENT
+                  val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(px(12), px(12), px(12), px(12))
+                  }
+
+                  val ipInfo = TextView(this).apply {
+                      text = "Мой IP: ${localIps()}  (порт $PORT)"
+                      textSize = 14f
+                      setTextIsSelectable(true)
+                  }
+                  root.addView(ipInfo, LinearLayout.LayoutParams(match, wrap))
+
+                  val nameInput = EditText(this).apply {
+                      hint = "Ваше имя"
+                      setSingleLine()
+                      setText(prefs.getString("name", ""))
+                  }
+                  root.addView(nameInput, LinearLayout.LayoutParams(match, wrap))
+
+                  val peerRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val peerInput = EditText(this).apply {
+                      hint = "IP собеседника, например 192.168.0.12"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                      setSingleLine()
+                      setText(prefs.getString("peer", ""))
+                  }
+                  val connectBtn = Button(this).apply { text = "Подключить" }
+                  peerRow.addView(peerInput, LinearLayout.LayoutParams(0, wrap, 1f))
+                  peerRow.addView(connectBtn, LinearLayout.LayoutParams(wrap, wrap))
+                  root.addView(peerRow, LinearLayout.LayoutParams(match, wrap))
+
+                  adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, ArrayList<String>())
+                  val list = ListView(this).apply {
+                      this.adapter = this@MainActivity.adapter
+                      transcriptMode = ListView.TRANSCRIPT_MODE_ALWAYS_SCROLL
+                      isStackFromBottom = true
+                      divider = null
+                  }
+                  root.addView(list, LinearLayout.LayoutParams(match, 0, 1f))
+
+                  val msgRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val msgInput = EditText(this).apply {
+                      hint = "Сообщение"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                          InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                      maxLines = 4
+                  }
+                  val sendBtn = Button(this).apply { text = "Отправить" }
+                  msgRow.addView(msgInput, LinearLayout.LayoutParams(0, wrap, 1f))
+                  msgRow.addView(sendBtn, LinearLayout.LayoutParams(wrap, wrap))
+                  root.addView(msgRow, LinearLayout.LayoutParams(match, wrap))
+
+                  setContentView(root)
+
+                  node = PeerNode(
+                      port = PORT,
+                      onEvent = { text -> addLine("• $text") },
+                      onMessage = { from, text, mine ->
+                          addLine(if (mine) "Вы: $text" else "$from: $text")
+                      }
+                  )
+                  node.myName = currentName(nameInput)
+                  node.start()
+
+                  nameInput.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          node.myName = currentName(nameInput)
+                          prefs.edit().putString("name", nameInput.text.toString().trim()).apply()
+                      }
+                  })
+
+                  connectBtn.setOnClickListener {
+                      val host = peerInput.text.toString().trim()
+                      if (host.isEmpty()) {
+                          addLine("• Введите IP собеседника")
+                          return@setOnClickListener
+                      }
+                      prefs.edit().putString("peer", host).apply()
+                      node.myName = currentName(nameInput)
+                      node.connect(host)
+                  }
+
+                  sendBtn.setOnClickListener {
+                      val text = msgInput.text.toString().trim()
+                      if (text.isEmpty()) return@setOnClickListener
+                      if (text.length > MAX_LEN) {
+                          addLine("• Сообщение слишком длинное (максимум $MAX_LEN символов)")
+                          return@setOnClickListener
+                      }
+                      node.myName = currentName(nameInput)
+                      node.send(text)
+                      msgInput.setText("")
+                  }
+              }
+
+              private fun currentName(input: EditText): String =
+                  input.text.toString().trim().ifBlank { "Аноним" }
+
+              private fun addLine(text: String) {
+                  runOnUiThread { adapter.add(text) }
+              }
+
+              private fun localIps(): String {
+                  return try {
+                      val result = ArrayList<String>()
+                      val ifaces = NetworkInterface.getNetworkInterfaces()
+                      while (ifaces != null && ifaces.hasMoreElements()) {
+                          val iface = ifaces.nextElement()
+                          if (!iface.isUp || iface.isLoopback) continue
+                          val addrs = iface.inetAddresses
+                          while (addrs.hasMoreElements()) {
+                              val a = addrs.nextElement()
+                              if (a is Inet4Address && !a.isLoopbackAddress) {
+                                  result.add(a.hostAddress ?: continue)
+                              }
+                          }
+                      }
+                      if (result.isEmpty()) "нет сети" else result.joinToString(", ")
+                  } catch (e: Exception) {
+                      "неизвестно"
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  node.stop()
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" \
+            app/build/outputs/apk/debug/app-debug.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "P2P Chat build ${{ github.run_number }}" \
+            --notes "Debug APK"
